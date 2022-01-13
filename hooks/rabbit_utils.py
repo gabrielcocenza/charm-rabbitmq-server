@@ -48,6 +48,7 @@ from rabbitmq_context import (
 from charmhelpers.contrib.charmsupport import nrpe
 import charmhelpers.contrib.openstack.deferred_events as deferred_events
 from charmhelpers.core.templating import render
+from charmhelpers.core.unitdata import kv
 
 from charmhelpers.contrib.openstack.utils import (
     _determine_os_workload_status,
@@ -107,6 +108,8 @@ from charmhelpers.fetch import (
 
 CLUSTER_MODE_KEY = 'cluster-partition-handling'
 CLUSTER_MODE_FOR_INSTALL = 'ignore'
+
+from lib.policies import POLICY_HANDLERS, BasePolicy
 
 PACKAGES = ['rabbitmq-server', 'python3-amqplib', 'lockfile-progs',
             'python3-croniter']
@@ -319,6 +322,151 @@ def list_vhosts():
         return []
 
 
+def list_policies():
+    """Returns a list of all the available policies
+
+    :returns: List of policies on all vhosts
+    :rtype: [str]
+    """
+
+    def _json_processor(policies):
+        for policy in policies:
+            policy["apply_to"] = policy.pop("apply-to")
+        return policies
+
+    def _raw_processor(output):
+        keys = "vhost name apply_to pattern definition priority".split()
+        return [
+            OrderedDict(zip(keys, line.split("\t")))
+            for line in output.splitlines()[1:]
+        ]
+
+    policies = []
+    vhosts = list_vhosts()
+    for vhost in vhosts:
+        try:
+            policies = policies + query_rabbit(
+                ["list_policies", "-p", vhost],
+                raw_processor=_raw_processor,
+                json_processor=_json_processor,
+            )
+        except Exception as ex:
+            # if no policies, just return an empty list
+            log(str(ex), level=ERROR)
+            return []
+    return policies
+
+
+def get_config_policies(rel_policies=None):
+    """Get the policies from juju config and from relation as parameter.
+
+    :param rel_policies: Policies to create via relation, defaults to None
+    :type rel_policies: [Dict], optional
+    :return: Set of policies objects and if should update because of
+             configuration change
+    :rtype: {BasePolicy}, Bool
+    """
+    update = False
+    charm_config = config()
+    juju_config_policies = json.loads(
+        config("policies").replace("\n", "").replace(" ", "")
+    )
+
+    if charm_config.changed("policies"):
+        update = True
+
+    try:
+        config_policies = set(
+            [
+                POLICY_HANDLERS[policy.get("type", "generic")](**policy)
+                for policy in juju_config_policies
+            ]
+        )
+        if rel_policies:
+            relation_policies = set(
+                [
+                    POLICY_HANDLERS[policy.get("type", "generic")](**policy)
+                    for policy in json.loads(rel_policies)
+                ]
+            )
+            config_policies = config_policies | relation_policies
+
+        for policy in list(config_policies):
+            if policy.vhost == "*":
+                config_policies.remove(policy)
+                vhosts = list_vhosts()
+                for vhost in vhosts:
+                    _policy = copy.deepcopy(policy)
+                    _policy.vhost = vhost
+                    config_policies.add(_policy)
+
+    except Exception as ex:
+        log(
+            (
+                "Error: {} \n Check the config file on how "
+                "to set policies."
+            ).format(ex),
+            level=ERROR,
+        )
+        return None, None
+    # should relation policies be included on the juju config policies?
+    return config_policies, update
+
+
+def create_policies(config_policies, update=False):
+    """Create RabbitMQ policies from configuration and/or relation
+       if not found in local data base
+
+    :param config_policies: Set of policies objects
+    :type config_policies: {BasePolicy}
+    :param update: Update policies if they already exist, defaults to False
+    :type update: bool, optional
+    """
+
+    kvstore = kv()
+    p_tracker = kvstore.get("policies") or []
+    policy_tracker = set([BasePolicy(**policy) for policy in p_tracker])
+
+    create_policies = config_policies - policy_tracker
+
+    if create_policies:
+        for policy in create_policies:
+            create_vhost(policy.vhost)
+            policy.set()
+            policy_tracker.add(policy)
+
+    if update:
+        for policy in config_policies:
+            policy.set()
+            policy_tracker.add(policy)
+
+    cluster_policies = set(
+        [BasePolicy(**policy) for policy in list_policies()]
+    )
+
+    if cluster_policies != policy_tracker:
+        unknown_policies = cluster_policies - policy_tracker
+        missing_policies = policy_tracker - cluster_policies
+        log(
+            (
+                "Policies are inconsistent with local data base. "
+                "Policies should be set by juju config or relation and "
+                "should be clear with juju actions.\n"
+                "Unknown policies in the cluster: {}\n"
+                "Missing policies in the cluster {}\n"
+            ).format(unknown_policies, missing_policies),
+            level=WARNING,
+        )
+
+    tracker = [
+        {"vhost": policy.vhost, "name": policy.name}
+        for policy in policy_tracker
+    ]
+
+    kvstore.set(key="policies", value=tracker)
+    kvstore.flush()
+
+
 def list_vhost_queue_info(vhost):
     """Provide a list of queue info objects for the given vhost.
 
@@ -421,103 +569,6 @@ def grant_permissions(user, vhost):
                 vhost, user, '.*', '.*', '.*')
 
 
-def set_policy(vhost, policy_name, match, value):
-    log("setting policy", level='DEBUG')
-    rabbitmqctl('set_policy', '-p', vhost,
-                policy_name, match, value)
-
-
-def set_ha_mode(vhost, mode, params=None, sync_mode='automatic'):
-    """Valid mode values:
-
-      * 'all': Queue is mirrored across all nodes in the cluster. When a new
-         node is added to the cluster, the queue will be mirrored to that node.
-      * 'exactly': Queue is mirrored to count nodes in the cluster.
-      * 'nodes': Queue is mirrored to the nodes listed in node names
-
-    More details at http://www.rabbitmq.com./ha.html
-
-    :param vhost: virtual host name
-    :param mode: ha mode
-    :param params: values to pass to the policy, possible values depend on the
-                   mode chosen.
-    :param sync_mode: when `mode` is 'exactly' this used to indicate how the
-                      sync has to be done
-                      http://www.rabbitmq.com./ha.html#eager-synchronisation
-    """
-
-    if caching_cmp_pkgrevno('rabbitmq-server', '3.0.0') < 0:
-        log(("Mirroring queues cannot be enabled, only supported "
-             "in rabbitmq-server >= 3.0"), level=WARNING)
-        log(("More information at http://www.rabbitmq.com/blog/"
-             "2012/11/19/breaking-things-with-rabbitmq-3-0"), level='INFO')
-        return
-
-    if mode == 'all':
-        definition = {
-            "ha-mode": "all",
-            "ha-sync-mode": sync_mode}
-    elif mode == 'exactly':
-        definition = {
-            "ha-mode": "exactly",
-            "ha-params": params,
-            "ha-sync-mode": sync_mode}
-    elif mode == 'nodes':
-        definition = {
-            "ha-mode": "nodes",
-            "ha-params": params,
-            "ha-sync-mode": sync_mode}
-    else:
-        raise RabbitmqError(("Unknown mode '%s', known modes: "
-                             "all, exactly, nodes"))
-
-    log("Setting HA policy to vhost '%s'" % vhost, level='INFO')
-    set_policy(vhost, 'HA', r'^(?!amq\.).*', json.dumps(definition))
-
-
-def clear_ha_mode(vhost, name='HA', force=False):
-    """
-    Clear policy from the `vhost` by `name`
-    """
-    if cmp_pkgrevno('rabbitmq-server', '3.0.0') < 0:
-        log(("Mirroring queues not supported "
-             "in rabbitmq-server >= 3.0"), level=WARNING)
-        log(("More information at http://www.rabbitmq.com/blog/"
-             "2012/11/19/breaking-things-with-rabbitmq-3-0"), level='INFO')
-        return
-
-    log("Clearing '%s' policy from vhost '%s'" % (name, vhost), level='INFO')
-    try:
-        rabbitmqctl('clear_policy', '-p', vhost, name)
-    except subprocess.CalledProcessError as ex:
-        if not force:
-            raise ex
-
-
-def set_all_mirroring_queues(enable):
-    """
-    :param enable: if True then enable mirroring queue for all the vhosts,
-                   otherwise the HA policy is removed
-    """
-    if cmp_pkgrevno('rabbitmq-server', '3.0.0') < 0:
-        log(("Mirroring queues not supported "
-             "in rabbitmq-server >= 3.0"), level=WARNING)
-        log(("More information at http://www.rabbitmq.com/blog/"
-             "2012/11/19/breaking-things-with-rabbitmq-3-0"), level='INFO')
-        return
-
-    if enable:
-        status_set('active', 'Enabling queue mirroring')
-    else:
-        status_set('active', 'Disabling queue mirroring')
-
-    for vhost in list_vhosts():
-        if enable:
-            set_ha_mode(vhost, 'all')
-        else:
-            clear_ha_mode(vhost, force=True)
-
-
 def rabbitmqctl(action, *args):
     ''' Run rabbitmqctl with action and args. This function uses
         subprocess.check_call. For uses that need check_output
@@ -544,38 +595,6 @@ def rabbitmqctl(action, *args):
         cmd.extend(['--timeout', str(WAIT_TIMEOUT_SECONDS)])
     log("Running {}".format(cmd), 'DEBUG')
     subprocess.check_call(cmd)
-
-
-def configure_notification_ttl(vhost, ttl=3600000):
-    ''' Configure 1h minute TTL for notfication topics in the provided vhost
-        This is a workaround for filling notification queues in OpenStack
-        until a more general service discovery mechanism exists so that
-        notifications can be enabled/disabled on each individual service.
-    '''
-    rabbitmqctl('set_policy',
-                'TTL', '^(versioned_)?notifications.*',
-                '{{"message-ttl":{ttl}}}'.format(ttl=ttl),
-                '--priority', '1',
-                '--apply-to', 'queues',
-                '-p', vhost)
-
-
-def configure_ttl(vhost, ttlname, ttlreg, ttl):
-    ''' Some topic queues like in heat also need to set TTL, see lp:1925436
-        Configure TTL for heat topics in the provided vhost, this is a
-        workaround for filling heat queues and for future other queues
-    '''
-    log('configure_ttl: ttlname={} ttlreg={} ttl={}'.format(
-        ttlname, ttlreg, ttl), INFO)
-    if not all([ttlname, ttlreg, ttl]):
-        return
-    rabbitmqctl('set_policy',
-                '{ttlname}'.format(ttlname=ttlname),
-                '"{ttlreg}"'.format(ttlreg=ttlreg),
-                '{{"expires":{ttl}}}'.format(ttl=ttl),
-                '--priority', '1',
-                '--apply-to', 'queues',
-                '-p', vhost)
 
 
 def rabbitmqctl_normalized_output(*args):

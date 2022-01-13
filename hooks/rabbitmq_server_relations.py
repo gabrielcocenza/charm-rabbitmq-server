@@ -140,99 +140,44 @@ def install():
     rabbit.install_or_upgrade_packages()
 
 
-def validate_amqp_config_tracker(f):
-    """Decorator to mark all existing tracked amqp configs as stale so that
-    they are refreshed the next time the current unit leader.
-    """
-    def _validate_amqp_config_tracker(*args, **kwargs):
-        if not is_leader():
-            kvstore = kv()
-            tracker = kvstore.get('amqp_config_tracker')
-            if tracker:
-                for rid in tracker:
-                    tracker[rid]['stale'] = True
-
-                kvstore.set(key='amqp_config_tracker', value=tracker)
-                kvstore.flush()
-
-        return f(*args, **kwargs)
-    return _validate_amqp_config_tracker
-
-
-def configure_amqp(username, vhost, relation_id, admin=False,
-                   ttlname=None, ttlreg=None, ttl=None):
+def configure_amqp(username, vhost, admin=False):
     """Configure rabbitmq server.
 
-    This function creates user/password, vhost and sets user permissions. It
-    also enabales mirroring queues if requested.
+    This function creates user/password, vhost and sets user permissions.
 
     Calls to rabbitmqctl are costly and as such we aim to limit them by only
     doing them if we detect that a settings needs creating or updating. To
     achieve this we track what we set by storing key/value pairs associated
-    with a particular relation id in a local database.
-
-    Since this function is only supposed to be called by the cluster leader,
-    the database is expected to be invalidated if it exists and we are no
-    longer leader so as to ensure that a leader switch results in a
-    rabbitmq configuraion consistent with the current leader's view.
+    in a local database.
 
     :param username: client username.
     :param vhost: vhost name.
-    :param relation_id: optional relation id used to identify the context of
-                        this operation. This should always be provided
-                        so that we can track what has been set.
     :param admin: boolean value defining whether the new user is admin.
-    :param ttlname: the name of ttl
-    :param ttlreg: the regular expression of ttl
-    :param ttl: the vaule of ttl
     :returns: user password
     """
-    log("Configuring rabbitmq for user '{}' vhost '{}' (rid={})".
-        format(username, vhost, relation_id), DEBUG)
-
-    if not relation_id:
-        raise Exception("Invalid relation id '{}' provided to "
-                        "{}()".format(relation_id, configure_amqp.__name__))
+    log("Configuring rabbitmq for user '{}' vhost '{}'".
+        format(username, vhost), DEBUG)
 
     # get and update service password
     password = rabbit.get_rabbit_password(username)
 
-    expected = {'username': username, 'vhost': vhost, 'ttl': ttl,
-                'mirroring-queues': config('mirroring-queues')}
-    kvstore = kv()
-    tracker = kvstore.get('amqp_config_tracker') or {}
-    val = tracker.get(relation_id)
-    if val == expected and not val.get('stale'):
-        log("Rabbit already configured for relation "
-            "'{}'".format(relation_id), DEBUG)
-        return password
-    else:
-        tracker[relation_id] = expected
-
-    # update vhost
+    # creates vhost if doesn't exist'
     rabbit.create_vhost(vhost)
-    # NOTE(jamespage): Workaround until we have a good way
-    #                  of generally disabling notifications
-    #                  based on which services are deployed.
-    if vhost == 'openstack':
-        rabbit.configure_notification_ttl(vhost,
-                                          config('notification-ttl'))
-        rabbit.configure_ttl(vhost, ttlname, ttlreg, ttl)
 
-    if admin:
-        rabbit.create_user(username, password, ['administrator'])
-    else:
-        rabbit.create_user(username, password)
-    rabbit.grant_permissions(username, vhost)
+    kvstore = kv()
+    users = kvstore.get('users') or []
 
-    # NOTE(freyes): after rabbitmq-server 3.0 the method to define HA in the
-    # queues is different
-    # http://www.rabbitmq.com/blog/2012/11/19/breaking-things-with-rabbitmq-3-0
-    if config('mirroring-queues'):
-        rabbit.set_ha_mode(vhost, 'all')
+    if username not in users:
+        users.append(username)
 
-    kvstore.set(key='amqp_config_tracker', value=tracker)
-    kvstore.flush()
+        if admin:
+            rabbit.create_user(username, password, ['administrator'])
+        else:
+            rabbit.create_user(username, password)
+
+        rabbit.grant_permissions(username, vhost)
+        kvstore.set(key='users', value=users)
+        kvstore.flush()
 
     return password
 
@@ -259,7 +204,6 @@ def update_clients(check_deferred_restarts=True):
                     check_deferred_restarts=check_deferred_restarts)
 
 
-@validate_amqp_config_tracker
 @hooks.hook('amqp-relation-changed')
 def amqp_changed(relation_id=None, remote_unit=None,
                  check_deferred_restarts=True):
@@ -303,40 +247,13 @@ def amqp_changed(relation_id=None, remote_unit=None,
             username = current['username']
             vhost = current['vhost']
             admin = current.get('admin', False)
-            ttlname = current.get('ttlname')
-            ttlreg = current.get('ttlreg')
-            ttl = current.get('ttl')
-            amqp_rid = relation_id or get_relation_id()
-            password = configure_amqp(username, vhost, amqp_rid, admin=admin,
-                                      ttlname=ttlname, ttlreg=ttlreg, ttl=ttl)
+            rel_policies = current.get('policies')
+            if rel_policies:
+                config_policies = rabbit.get_config_policies(rel_policies)
+                rabbit.create_policies(config_policies)
+
+            password = configure_amqp(username, vhost, admin=admin)
             relation_settings['password'] = password
-        else:
-            # NOTE(hopem): we should look at removing this code since i don't
-            #              think it's ever used anymore and stems from the days
-            #              when we needed to ensure consistency between
-            #              peerstorage (replaced by leader get/set) and amqp
-            #              relations.
-            queues = {}
-            for k, v in current.items():
-                amqp_rid = k.split('_')[0]
-                x = '_'.join(k.split('_')[1:])
-                if amqp_rid not in queues:
-                    queues[amqp_rid] = {}
-
-                queues[amqp_rid][x] = v
-
-            for amqp_rid in queues:
-                if singleset.issubset(queues[amqp_rid]):
-                    username = queues[amqp_rid]['username']
-                    vhost = queues[amqp_rid]['vhost']
-                    ttlname = queues[amqp_rid].get('ttlname')
-                    ttlreg = queues[amqp_rid].get('ttlreg')
-                    ttl = queues[amqp_rid].get('ttl')
-                    password = configure_amqp(username, vhost, amqp_rid,
-                                              admin=admin, ttlname=ttlname,
-                                              ttlreg=ttlreg, ttl=ttl)
-                    key = '_'.join([amqp_rid, 'password'])
-                    relation_settings[key] = password
 
         ssl_utils.configure_client_ssl(relation_settings)
 
@@ -779,19 +696,13 @@ def config_changed(check_deferred_restarts=True):
     if not is_leader():
         return
 
-    rabbit.set_all_mirroring_queues(config('mirroring-queues'))
-
     # Update cluster in case min-cluster-size has changed
     for rid in relation_ids('cluster'):
         for unit in related_units(rid):
             cluster_changed(relation_id=rid, remote_unit=unit)
 
-    # NOTE(jamespage): Workaround until we have a good way
-    #                  of generally disabling notifications
-    #                  based on which services are deployed.
-    if 'openstack' in rabbit.list_vhosts():
-        rabbit.configure_notification_ttl('openstack',
-                                          config('notification-ttl'))
+    config_policies, update_policies = rabbit.get_config_policies()
+    rabbit.create_policies(config_policies, update_policies)
 
 
 @hooks.hook('leader-elected')

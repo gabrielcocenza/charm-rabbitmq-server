@@ -21,8 +21,6 @@ import tempfile
 from unit_tests.test_utils import CharmTestCase
 from unittest.mock import patch, MagicMock, call
 
-from charmhelpers.core.unitdata import Storage
-
 os.environ['JUJU_UNIT_NAME'] = 'UNIT_TEST/0'  # noqa - needed for import
 
 # python-apt is not installed as part of test-requirements but is imported by
@@ -216,115 +214,73 @@ class RelationUtil(CharmTestCase):
                                              remote_unit='client/0',
                                              check_deferred_restarts=True)
 
-    @patch.object(rabbitmq_server_relations.rabbit,
-                  'configure_ttl')
-    @patch.object(rabbitmq_server_relations.rabbit,
-                  'configure_notification_ttl')
-    @patch.object(rabbitmq_server_relations, 'is_leader')
-    @patch.object(rabbitmq_server_relations.rabbit, 'set_ha_mode')
-    @patch.object(rabbitmq_server_relations.rabbit, 'get_rabbit_password')
     @patch.object(rabbitmq_server_relations.rabbit, 'create_vhost')
+    @patch.object(rabbitmq_server_relations.rabbit, 'get_rabbit_password')
     @patch.object(rabbitmq_server_relations.rabbit, 'create_user')
     @patch.object(rabbitmq_server_relations.rabbit, 'grant_permissions')
-    @patch.object(rabbitmq_server_relations, 'config')
-    def test_configure_amqp(self, mock_config,
-                            mock_grant_permissions, mock_create_vhost,
-                            mock_create_user, mock_get_rabbit_password,
-                            mock_set_ha_mode, mock_is_leader,
-                            mock_configure_notification_ttl,
-                            mock_configure_ttl):
-        config_data = {
-            'notification-ttl': 450000,
-            'mirroring-queues': True,
-        }
-        mock_is_leader.return_value = True
-        mock_config.side_effect = lambda attribute: config_data.get(attribute)
-        tmpdir = tempfile.mkdtemp()
-        try:
-            db_path = '{}/kv.db'.format(tmpdir)
-            rid = 'amqp:1'
-            store = Storage(db_path)
-            with patch('charmhelpers.core.unitdata._KV', store):
-                # Check .set
-                with patch.object(store, 'set') as mock_set:
-                    rabbitmq_server_relations.configure_amqp('user_foo',
-                                                             'vhost_blah', rid)
+    @patch("charmhelpers.core.unitdata._KV")
+    def test_configure_amqp_user_inexistent(
+        self,
+        mock_kv,
+        mock_grant_permissions,
+        mock_create_user,
+        mock_get_rabbit_password,
+        mock_create_vhost
+    ):
+        mock_kv.side_effect = MagicMock()
+        mock_kv.get.return_value = ['user_bar']
+        mock_get_rabbit_password.return_value = 'pwd_user_foo'
+        username = 'user_foo'
+        vhost = 'openstack'
+        expected_tracker = call.set(
+            key='users', value=['user_bar', 'user_foo']
+        )
+        expected_user_call = call('user_foo', 'pwd_user_foo')
+        rabbitmq_server_relations.configure_amqp(username, vhost)
+        kv_calls = mock_kv.mock_calls
+        self.assertTrue(expected_tracker in kv_calls)
+        self.assertTrue(call.get("users") in kv_calls)
+        self.assertTrue(call.flush() in kv_calls)
+        self.assertTrue(mock_get_rabbit_password.called)
+        self.assertTrue(mock_create_user.called)
+        self.assertTrue(expected_user_call in mock_create_user.mock_calls)
+        self.assertTrue(mock_grant_permissions.called)
+        self.assertTrue(mock_create_vhost.called)
 
-                    d = {rid: {"username": "user_foo", "vhost": "vhost_blah",
-                               "ttl": None, "mirroring-queues": True}}
-                    mock_set.assert_has_calls([call(key='amqp_config_tracker',
-                                                    value=d)])
+        # with admin tag
+        mock_create_user.reset_mock()
+        mock_kv.get.return_value = ['user_bar']
+        expected_user_call = call(
+            'user_foo', 'pwd_user_foo', ['administrator']
+        )
+        rabbitmq_server_relations.configure_amqp(username, vhost, True)
+        self.assertTrue(expected_user_call in mock_create_user.mock_calls)
 
-                    for m in [mock_grant_permissions, mock_create_vhost,
-                              mock_create_user, mock_set_ha_mode]:
-                        self.assertTrue(m.called)
-                        m.reset_mock()
-
-                # Check .get
-                with patch.object(store, 'get') as mock_get:
-                    mock_get.return_value = d
-                    rabbitmq_server_relations.configure_amqp('user_foo',
-                                                             'vhost_blah', rid)
-                    mock_set.assert_has_calls([call(key='amqp_config_tracker',
-                                                    value=d)])
-                    for m in [mock_grant_permissions, mock_create_vhost,
-                              mock_create_user, mock_set_ha_mode]:
-                        self.assertFalse(m.called)
-
-                # Check invalid relation id
-                self.assertRaises(Exception,
-                                  rabbitmq_server_relations.configure_amqp,
-                                  'user_foo', 'vhost_blah', None, admin=True)
-
-                # Test writing data
-                d = {}
-                for rid, user in [('amqp:1', 'userA'), ('amqp:2', 'userB')]:
-                    rabbitmq_server_relations.configure_amqp(user,
-                                                             'vhost_blah', rid)
-
-                    d.update({rid: {"username": user, "vhost": "vhost_blah",
-                                    "ttl": None, "mirroring-queues": True}})
-                    self.assertEqual(store.get('amqp_config_tracker'), d)
-
-                @rabbitmq_server_relations.validate_amqp_config_tracker
-                def fake_configure_amqp(*args, **kwargs):
-                    return rabbitmq_server_relations.configure_amqp(*args,
-                                                                    **kwargs)
-
-                # Test invalidating data
-                mock_is_leader.return_value = False
-                d['amqp:2']['stale'] = True
-                for rid, user in [('amqp:1', 'userA'), ('amqp:3', 'userC')]:
-                    fake_configure_amqp(user, 'vhost_blah', rid)
-                    d[rid] = {"username": user, "vhost": "vhost_blah",
-                              "ttl": None,
-                              "mirroring-queues": True, 'stale': True}
-                    # Since this is a dummy case we need to toggle the stale
-                    # values.
-                    del d[rid]['stale']
-                    self.assertEqual(store.get('amqp_config_tracker'), d)
-                    d[rid]['stale'] = True
-
-                mock_configure_notification_ttl.assert_not_called()
-                mock_configure_ttl.assert_not_called()
-
-                # Test openstack notification workaround
-                d = {}
-                for rid, user in [('amqp:1', 'userA')]:
-                    rabbitmq_server_relations.configure_amqp(
-                        user, 'openstack', rid, admin=False,
-                        ttlname='heat_expiry',
-                        ttlreg='heat-engine-listener|engine_worker', ttl=45000)
-                (mock_configure_notification_ttl.
-                    assert_called_once_with('openstack', 450000))
-                (mock_configure_ttl.
-                    assert_called_once_with(
-                        'openstack', 'heat_expiry',
-                        'heat-engine-listener|engine_worker', 45000))
-
-        finally:
-            if os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir)
+    @patch.object(rabbitmq_server_relations.rabbit, 'create_vhost')
+    @patch.object(rabbitmq_server_relations.rabbit, 'get_rabbit_password')
+    @patch.object(rabbitmq_server_relations.rabbit, 'create_user')
+    @patch.object(rabbitmq_server_relations.rabbit, 'grant_permissions')
+    @patch("charmhelpers.core.unitdata._KV")
+    def test_configure_amqp_user_existent(
+        self,
+        mock_kv,
+        mock_grant_permissions,
+        mock_create_user,
+        mock_get_rabbit_password,
+        mock_create_vhost
+    ):
+        mock_kv.side_effect = MagicMock()
+        mock_kv.get.return_value = ['user_foo']
+        username = 'user_foo'
+        vhost = 'openstack'
+        rabbitmq_server_relations.configure_amqp(username, vhost)
+        kv_calls = mock_kv.mock_calls
+        self.assertTrue(call.get("users") in kv_calls)
+        self.assertFalse(call.flush() in kv_calls)
+        self.assertTrue(mock_get_rabbit_password.called)
+        self.assertFalse(mock_create_user.called)
+        self.assertFalse(mock_grant_permissions.called)
+        self.assertTrue(mock_create_vhost.called)
 
     @patch.object(rabbitmq_server_relations.rabbit, 'grant_permissions')
     @patch('rabbit_utils.create_user')

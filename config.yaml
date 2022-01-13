@@ -32,12 +32,31 @@ options:
     description: |
       Enable the management plugin. This only applys to deployments using
       Focal or later.
-  mirroring-queues:
-    type: boolean
-    default: True
+  # Declarative Policies configuration
+  policies:
+    type: string
+    default: |
+      [
+        {
+          "vhost": "*",
+          "name": "HA",
+          "pattern": "^(?!amq\\.).*",
+          "type": "ha"
+        },
+        {
+          "vhost": "openstack",
+          "name": "TTL",
+          "pattern": "^(versioned_)?notifications.*",
+          "type": "ttl"
+        }
+      ]
     description: |
-      When set to True the 'ha-mode: all' policy is applied to all the
-      exchanges that match the expression '^(?!amq\.).*'
+      List of dictionaries containing the policies applied in the cluster.
+      Every policy should have at least the fields: 'vhost', 'name' and 'pattern'.
+      It's strongly encouraged to specify the 'type' of the policy which can be found
+      at the module policies.py.
+      If vhost field is equal to '*' the policy will be applied on all vhosts available.
+      Must be a valid JSON document.
   cluster-partition-handling:
     type: string
     default: ignore
@@ -311,14 +330,6 @@ options:
       collisions. Known wait is the amount of time between one node executing
       an operation and another. On slower hardware this value may need to be
       larger than the default of 30 seconds.
-  notification-ttl:
-    type: int
-    default: 3600000
-    description: |
-      TTL in MS for notification queues in the openstack vhost. Defaults to
-      1 hour, but can be tuned up or down depending on deployment requirements.
-      This ensures that any un-consumed notifications don't build up over
-      time, causing disk capacity issues.
   check-vhosts:
     type: string
     default:

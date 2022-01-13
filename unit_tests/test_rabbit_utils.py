@@ -19,7 +19,9 @@ from unittest import mock
 import os
 import sys
 import tempfile
+import types
 from datetime import timedelta
+from lib.policies import HAPolicy, TTLPolicy
 
 from unit_tests.test_utils import CharmTestCase
 
@@ -149,6 +151,31 @@ openstack
 
 RABBITMQCTL_LIST_VHOSTS_382 = (b'[{"name": "/"},{"name": "landscape"},'
                                b'{"name": "openstack"}]')
+
+
+RABBITMQCTL_LIST_POLICIES = {
+    '/': (
+        b'Listing policies\n'
+        b'/	HA	all	foo	{"ha-mode":"all","ha-sync-mode":"automatic"}	1'
+    ),
+    'openstack': (
+        b'Listing policies\n'
+        b'openstack	HA	all	bar	{"ha-mode":"all","ha-sync-mode":"automatic"}	1'
+    ),
+}
+
+RABBITMQCTL_LIST_POLICIES_382 = {
+    '/': (
+        b'[{"vhost":"/","name":"HA","pattern":"foo",'
+        b'"apply-to":"queues","definition":{"ha-mode": "all",'
+        b'"ha-sync-mode": "automatic"},"priority":1}]'
+    ),
+    'openstack': (
+        b'[{"vhost":"openstack","name":"HA","pattern":"bar",'
+        b'"apply-to":"queues","definition":{"ha-mode": "all",'
+        b'"ha-sync-mode": "automatic"},"priority":1}]'
+    ),
+}
 
 
 class UtilsTests(CharmTestCase):
@@ -981,33 +1008,6 @@ class UtilsTests(CharmTestCase):
         rabbit_utils.cluster_wait()
         mock_distributed_wait.assert_called_with(modulo=10, wait=60)
 
-    @mock.patch.object(rabbit_utils, 'rabbitmqctl')
-    def test_configure_notification_ttl(self, rabbitmqctl):
-        rabbit_utils.configure_notification_ttl('test',
-                                                23000)
-        rabbitmqctl.assert_called_once_with(
-            'set_policy',
-            'TTL', '^(versioned_)?notifications.*',
-            '{"message-ttl":23000}',
-            '--priority', '1',
-            '--apply-to', 'queues',
-            '-p', 'test'
-        )
-
-    @mock.patch.object(rabbit_utils, 'rabbitmqctl')
-    def test_configure_ttl(self, rabbitmqctl):
-        rabbit_utils.configure_ttl('test', ttlname='heat_expiry',
-                                   ttlreg='heat-engine-listener|engine_worker',
-                                   ttl=23000)
-        rabbitmqctl.assert_called_once_with(
-            'set_policy',
-            'heat_expiry', '"heat-engine-listener|engine_worker"',
-            '{"expires":23000}',
-            '--priority', '1',
-            '--apply-to', 'queues',
-            '-p', 'test'
-        )
-
     @mock.patch.object(rabbit_utils, 'leader_get')
     @mock.patch.object(rabbit_utils, 'is_partitioned')
     @mock.patch.object(rabbit_utils, 'wait_app')
@@ -1424,46 +1424,12 @@ class UtilsTests(CharmTestCase):
 
     @mock.patch('rabbit_utils.caching_cmp_pkgrevno')
     def test_rabbit_supports_json(self, mock_cmp_pkgrevno):
+        mock_cmp_pkgrevno.return_value = 0
+        self.assertTrue(rabbit_utils.rabbit_supports_json())
         mock_cmp_pkgrevno.return_value = 1
         self.assertTrue(rabbit_utils.rabbit_supports_json())
         mock_cmp_pkgrevno.return_value = -1
         self.assertFalse(rabbit_utils.rabbit_supports_json())
-
-    @mock.patch('rabbit_utils.caching_cmp_pkgrevno')
-    @mock.patch('rabbit_utils.set_policy')
-    @mock.patch('rabbit_utils.config')
-    def test_set_ha_mode(self,
-                         mock_config,
-                         mock_set_policy,
-                         mock_caching_cmp_pkgrevno):
-        """Testing set_ha_mode"""
-        mock_config.side_effect = self.test_config
-        mock_caching_cmp_pkgrevno.return_value = 1
-
-        expected_policy = {
-            'all': {
-                'ha-mode': 'all',
-                'ha-sync-mode': 'automatic',
-            },
-            'exactly': {
-                'ha-mode': 'exactly',
-                'ha-sync-mode': 'automatic',
-                'ha-params': 2,
-            },
-            'nodes': {
-                'ha-mode': 'nodes',
-                'ha-sync-mode': 'automatic',
-                'ha-params': ["rabbit@nodeA", "rabbit@nodeB"]
-            },
-        }
-        for mode, policy in expected_policy.items():
-            rabbit_utils.set_ha_mode('test_vhost', mode,
-                                     params=policy.get('ha-params'))
-            mock_set_policy.assert_called_once_with(
-                'test_vhost', 'HA', r'^(?!amq\.).*',
-                json.dumps(policy, sort_keys=True)
-            )
-            mock_set_policy.reset_mock()
 
     @mock.patch('rabbit_utils.config')
     def test_management_plugin_enabled(self, mock_config):
@@ -1478,3 +1444,271 @@ class UtilsTests(CharmTestCase):
             'DISTRIB_CODENAME': 'xenial'}
         self.test_config.set('management_plugin', True)
         self.assertFalse(rabbit_utils.management_plugin_enabled())
+
+    @mock.patch("rabbit_utils.list_vhosts")
+    @mock.patch("rabbit_utils.caching_cmp_pkgrevno")
+    @mock.patch("rabbit_utils.subprocess")
+    def test_list_policies(
+        self, mock_subprocess, mock_cmp_pkgrevno, mock_vhosts
+    ):
+        """Ensure list_policies parses output into the proper list"""
+        mock_vhosts.return_value = ["/", "openstack"]
+        mock_subprocess.check_output.side_effect = (
+            lambda cmd: RABBITMQCTL_LIST_POLICIES.get(cmd[3])
+        )
+        mock_cmp_pkgrevno.return_value = -1
+        expected_policies = [
+            collections.OrderedDict(
+                [
+                    ("vhost", "/"),
+                    ("name", "HA"),
+                    ("apply_to", "all"),
+                    ("pattern", "foo"),
+                    (
+                        "definition",
+                        '{"ha-mode":"all","ha-sync-mode":"automatic"}',
+                    ),
+                    ("priority", "1"),
+                ]
+            ),
+            collections.OrderedDict(
+                [
+                    ("vhost", "openstack"),
+                    ("name", "HA"),
+                    ("apply_to", "all"),
+                    ("pattern", "bar"),
+                    (
+                        "definition",
+                        '{"ha-mode":"all","ha-sync-mode":"automatic"}',
+                    ),
+                    ("priority", "1"),
+                ]
+            ),
+        ]
+        self.assertEqual(rabbit_utils.list_policies(), expected_policies)
+
+    @mock.patch("rabbit_utils.list_vhosts")
+    @mock.patch("rabbit_utils.caching_cmp_pkgrevno")
+    @mock.patch("rabbit_utils.subprocess")
+    def test_list_policies_382(
+        self, mock_subprocess, mock_cmp_pkgrevno, mock_vhosts
+    ):
+        """Ensure list_policies parses output into the proper list"""
+        mock_vhosts.return_value = ["/", "openstack"]
+        mock_subprocess.check_output.side_effect = (
+            lambda cmd: RABBITMQCTL_LIST_POLICIES_382.get(cmd[3])
+        )
+        mock_cmp_pkgrevno.return_value = 0
+        expected_policies = [
+            {
+                'vhost': "/",
+                'name': 'HA',
+                'pattern': 'foo',
+                'definition': {'ha-mode': 'all', 'ha-sync-mode': 'automatic'},
+                'priority': 1,
+                'apply_to': 'queues',
+            },
+            {
+                'vhost': "openstack",
+                'name': 'HA',
+                'pattern': 'bar',
+                'definition': {'ha-mode': 'all', 'ha-sync-mode': 'automatic'},
+                'priority': 1,
+                'apply_to': 'queues',
+            }
+        ]
+        cluster_policies = rabbit_utils.list_policies()
+        self.assertFalse(
+            any(
+                e_p != c_p
+                for e_p, c_p in zip(expected_policies, cluster_policies)
+            )
+        )
+
+    @mock.patch("rabbit_utils.log")
+    @mock.patch('rabbit_utils.list_vhosts')
+    @mock.patch('rabbit_utils.config')
+    def test_get_config_policies(self, mock_config, mock_vhosts, log):
+        test_config = self.test_config
+        test_config.changed = types.MethodType(
+            lambda self, attr: True, test_config
+        )
+        mock_config.side_effect = test_config
+        mock_vhosts.return_value = ["/", "openstack"]
+        rel_policies = json.dumps(
+            [
+                {
+                    "vhost": "openstack",
+                    "name": "heat_expiry",
+                    "pattern": "foo",
+                    "type": "ttl"
+                }
+            ]
+        )
+        expected_config_policies = set(
+            [
+                HAPolicy("/", "HA", "foo"),
+                HAPolicy("openstack", "HA", "bar"),
+                TTLPolicy("openstack", "heat_expiry", "foo"),
+                TTLPolicy("openstack", "TTL", "baz"),
+            ]
+        )
+        config_policies, update = rabbit_utils.get_config_policies(
+            rel_policies
+        )
+        self.assertEqual(expected_config_policies, config_policies)
+        self.assertTrue(update)
+        self.assertFalse(log.called)
+
+    @mock.patch("rabbit_utils.log")
+    @mock.patch('rabbit_utils.list_vhosts')
+    @mock.patch('rabbit_utils.config')
+    def test_get_config_policies_fails(self, mock_config, mock_vhosts, log):
+        # return None, None if fail to build the policy object
+        test_config = self.test_config
+        test_config.changed = types.MethodType(
+            lambda self, attr: False, test_config
+        )
+        mock_config.side_effect = test_config
+        mock_vhosts.return_value = ["/", "openstack"]
+        rel_policies = json.dumps(
+            [
+                {
+                    "vhost": "openstack",
+                    "name": "heat_expiry",
+                    "pattern": "foo",
+                    "inexistent_field": "bar",
+                    "type": "ttl",
+                }
+            ]
+        )
+
+        config_policies, update = rabbit_utils.get_config_policies(
+            rel_policies
+        )
+        self.assertEqual(None, config_policies)
+        self.assertEqual(None, update)
+        self.assertTrue(log.called)
+
+    @mock.patch("rabbit_utils.log")
+    @mock.patch("lib.policies.BasePolicy.set")
+    @mock.patch("rabbit_utils.list_policies")
+    @mock.patch("rabbit_utils.create_vhost")
+    @mock.patch("charmhelpers.core.unitdata._KV")
+    def test_create_policies(
+        self, mock_kv, mock_create_vhost, mock_list_policies, mock_set, log
+    ):
+        mock_kv.side_effect = mock.MagicMock()
+        mock_kv.get.return_value = []
+        config_policies = set(
+            [
+                HAPolicy("/", "HA", "foo"),
+                HAPolicy("openstack", "HA", "bar"),
+                TTLPolicy("openstack", "TTL", "baz"),
+            ]
+        )
+        config_policies_tracker = [
+            {"vhost": policy.vhost, "name": policy.name}
+            for policy in config_policies
+        ]
+        expected_tracker_call = mock.call.set(
+            key='policies',
+            value=config_policies_tracker
+        )
+        # cluster policies match with config
+        cluster_policies = config_policies_tracker
+        mock_list_policies.return_value = cluster_policies
+        rabbit_utils.create_policies(config_policies)
+        kv_calls = mock_kv.mock_calls
+        self.assertEqual(len(config_policies), len(mock_set.mock_calls))
+        self.assertTrue(expected_tracker_call in kv_calls)
+        self.assertTrue(mock.call.get("policies") in kv_calls)
+        self.assertTrue(mock.call.flush() in kv_calls)
+        self.assertTrue(mock_create_vhost.called)
+        self.assertFalse(log.called)
+
+    @mock.patch("rabbit_utils.log")
+    @mock.patch("lib.policies.BasePolicy.set")
+    @mock.patch("rabbit_utils.list_policies")
+    @mock.patch("rabbit_utils.create_vhost")
+    @mock.patch("charmhelpers.core.unitdata._KV")
+    def test_create_policies_update(
+        self, mock_kv, mock_create_vhost, mock_list_policies, mock_set, log
+    ):
+        mock_kv.side_effect = mock.MagicMock()
+        mock_kv.get.return_value = [
+            {
+                "vhost": "/",
+                "name": "HA",
+            },
+            {
+                "vhost": "openstack",
+                "name": "HA",
+            },
+            {"vhost": "openstack", "name": "TTL"},
+        ]
+        config_policies = set(
+            [
+                HAPolicy("/", "HA", "foo"),
+                HAPolicy("openstack", "HA", "bar"),
+                TTLPolicy("openstack", "TTL", "baz"),
+            ]
+        )
+        config_policies_tracker = [
+            {"vhost": policy.vhost, "name": policy.name}
+            for policy in config_policies
+        ]
+        expected_tracker_call = mock.call.set(
+            key='policies',
+            value=config_policies_tracker
+        )
+        # cluster policies match with config
+        cluster_policies = config_policies_tracker
+        mock_list_policies.return_value = cluster_policies
+        rabbit_utils.create_policies(config_policies, True)
+        kv_calls = mock_kv.mock_calls
+        self.assertEqual(len(config_policies), len(mock_set.mock_calls))
+        self.assertTrue(expected_tracker_call in kv_calls)
+        self.assertTrue(mock.call.get("policies") in kv_calls)
+        self.assertTrue(mock.call.flush() in kv_calls)
+        self.assertFalse(mock_create_vhost.called)
+        self.assertFalse(log.called)
+
+    @mock.patch("rabbit_utils.log")
+    @mock.patch("lib.policies.BasePolicy.set")
+    @mock.patch("rabbit_utils.list_policies")
+    @mock.patch("rabbit_utils.create_vhost")
+    @mock.patch("charmhelpers.core.unitdata._KV")
+    def test_create_policies_inconsistent(
+        self, mock_kv, mock_create_vhost, mock_list_policies, mock_set, log
+    ):
+        mock_kv.side_effect = mock.MagicMock()
+        mock_kv.get.return_value = []
+        config_policies = set(
+            [
+                HAPolicy("/", "HA", "foo"),
+                HAPolicy("openstack", "HA", "bar"),
+                TTLPolicy("openstack", "TTL", "baz"),
+            ]
+        )
+        config_policies_tracker = [
+            {"vhost": policy.vhost, "name": policy.name}
+            for policy in config_policies
+        ]
+        expected_tracker_call = mock.call.set(
+            key='policies',
+            value=config_policies_tracker
+        )
+        # cluster policies is different from the config
+        cluster_policies = config_policies_tracker + [
+            {"vhost": "foo", "name": "bar"}
+        ]
+        mock_list_policies.return_value = cluster_policies
+        rabbit_utils.create_policies(config_policies)
+        kv_calls = mock_kv.mock_calls
+        self.assertEqual(len(config_policies), len(mock_set.mock_calls))
+        self.assertTrue(expected_tracker_call in kv_calls)
+        self.assertTrue(mock.call.get("policies") in kv_calls)
+        self.assertTrue(mock.call.flush() in kv_calls)
+        self.assertTrue(mock_create_vhost.called)
+        self.assertTrue(log.called)
